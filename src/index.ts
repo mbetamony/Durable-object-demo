@@ -1,4 +1,4 @@
-import { DurableObject } from "cloudflare:workers";
+import { DurableObject } from "cloudflare:workers"
 
 /**
  * Welcome to Cloudflare Workers! This is your first Durable Objects application.
@@ -18,20 +18,9 @@ import { DurableObject } from "cloudflare:workers";
  * Associate bindings declared in wrangler.toml with the TypeScript type system
  */
 export interface Env {
-	// Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
-	// MY_KV_NAMESPACE: KVNamespace;
-	//
 	// Example binding to Durable Object. Learn more at https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-	MY_DURABLE_OBJECT: DurableObjectNamespace<MyDurableObject>;
-	//
-	// Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
-	// MY_BUCKET: R2Bucket;
-	//
-	// Example binding to a Service. Learn more at https://developers.cloudflare.com/workers/runtime-apis/service-bindings/
-	// MY_SERVICE: Fetcher;
-	//
-	// Example binding to a Queue. Learn more at https://developers.cloudflare.com/queues/javascript-apis/
-	// MY_QUEUE: Queue;
+	MY_DURABLE_OBJECT: DurableObjectNamespace<MyDurableObject>
+
 }
 
 /** A Durable Object's behavior is defined in an exported Javascript class */
@@ -44,21 +33,112 @@ export class MyDurableObject extends DurableObject {
 	 * @param env - The interface to reference bindings declared in wrangler.toml
 	 */
 	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
+		super(ctx, env)
 	}
 
-	/**
-	 * The Durable Object exposes an RPC method sayHello which will be invoked when when a Durable
-	 *  Object instance receives a request from a Worker via the same method invocation on the stub
-	 *
-	 * @param name - The name provided to a Durable Object instance from a Worker
-	 * @returns The greeting to be sent back to the Worker
-	 */
-	async sayHello(name: string): Promise<string> {
-		return `Hello, ${name}!`;
+	async fetch(request: Request): Promise<Response> {
+		const url = new URL(request.url)
+		if (url.pathname.endsWith('steps')) {
+            return await this.handleStepsRequest(request)
+        } else {
+            return await this.handleListenRequest(request)
+        }
 	}
+
+	async handleListenRequest(request: Request) {
+        if (request.headers.get("Upgrade") != "websocket") {
+            return new Response("expected websocket", { status: 400 })
+        }
+        let pair = new WebSocketPair()
+        this.ctx.acceptWebSocket(pair[1])
+        return new Response(null, { status: 101, webSocket: pair[0] })
+    }
+
+	async handleStepsRequest(request: Request) {
+        const newUrl = new URL(request.url)
+		// we don't need those, unless its running locally
+        newUrl.host = 'mbetamony:3000'
+        newUrl.protocol = 'http:'
+        const newReq = new Request(newUrl, request)
+
+        const apiResponse = await fetch(newReq)
+        switch (apiResponse.status) {
+            case 200:
+                const clone = apiResponse.clone()
+                const data = await clone.json()
+                this.broadcast(data as string)
+            default:
+                return apiResponse
+        }
+    }
+	broadcast( message: (ArrayBuffer | ArrayBufferView) | string) {
+		console.log('broadcasting')
+        if (typeof message !== "string") {
+            message = JSON.stringify(message)
+        }
+        this.ctx.getWebSockets().forEach(socket => {
+            try {
+                socket.send(message as string)
+            } catch (err) {
+                this.closeOrErrorHandler(socket)
+            }
+        })
+    }
+	async webSocketMessage(webSocket: WebSocket,  message: string) {
+        const data = JSON.parse(message)
+		if(data.projectID && data.manuscriptID && data.authToken) {	
+			const res = await this.fetchListen(data.projectID, data.manuscriptID, data.authToken)
+			webSocket.send(JSON.stringify(res))
+		}
+    }
+
+	async fetchListen(projectID: string, documentID: string, token: string) {
+		// for the listen, we can't simply fetch the request the same way we do it for the steps request
+		// the listen is initiated on webSockets, and projectID, documentID and token are sent from the websocket
+        const res = await fetch(`http://mbetamony:3000/api/v2/doc/${projectID}/manuscript/${documentID}/listen`, {
+            headers: this.headers(token),
+        })
+        try {
+            return await res.json()
+        } catch (error) {
+            console.log(error)
+            return ''
+        }
+    }
+	private headers(token: string) {
+        return {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+        }
+    }
+	async closeOrErrorHandler(webSocket: WebSocket) {
+		try {
+			webSocket.close()
+		} catch (err) {
+			console.log('error closing socket: ' + err)
+		}
+    }
+	async webSocketError(webSocket: WebSocket, error: string) {
+        console.log('socket error: ' + error)
+        this.closeOrErrorHandler(webSocket)
+      }
 }
-
+async function runWithErrorHandling(request: Request, func: Function) {
+    try {
+        return await func()
+    } catch (err: any) {
+        if (request.headers.get("Upgrade") == "websocket") {
+            let pair = new WebSocketPair()
+            pair[1].accept()
+            pair[1].send(JSON.stringify({ error: err.stack }))
+            pair[1].close(1011, "Uncaught exception during session setup")
+            return new Response(null, { status: 101, webSocket: pair[0] })
+        } else {
+            return new Response(err.stack, { status: 500 })
+        }
+    }
+}
 export default {
 	/**
 	 * This is the standard fetch handler for a Cloudflare Worker
@@ -69,18 +149,14 @@ export default {
 	 * @returns The response to be sent back to the client
 	 */
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		// We will create a `DurableObjectId` using the pathname from the Worker request
-		// This id refers to a unique instance of our 'MyDurableObject' class above
-		let id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(new URL(request.url).pathname);
-
-		// This stub creates a communication channel with the Durable Object instance
-		// The Durable Object constructor will be invoked upon the first call for a given id
-		let stub = env.MY_DURABLE_OBJECT.get(id);
-
-		// We call the `sayHello()` RPC method on the stub to invoke the method on the remote
-		// Durable Object instance
-		let greeting = await stub.sayHello("world");
-
-		return new Response(greeting);
+		return await runWithErrorHandling(request, async () => {
+			const url = new URL(request.url)
+			const regex = /manuscript\/(.*?)\//
+			const match = url.toString().match(regex)
+			const manuscriptID = match ? match[1] : ''
+			let id: DurableObjectId = env.MY_DURABLE_OBJECT.idFromName(manuscriptID)
+			let stub = env.MY_DURABLE_OBJECT.get(id)
+			return await stub.fetch(request)
+		})
 	},
-};
+}
